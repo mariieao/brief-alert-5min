@@ -1,0 +1,109 @@
+name: Brief orders monitor
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '3-58/5 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brief-orders-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-slim
+    timeout-minutes: 8
+    steps:
+      - name: Restore previous count
+        uses: actions/cache@v4
+        with:
+          path: brief-count.txt
+          key: brief-count-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            brief-count-
+
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Check new orders
+        env:
+          BRIEF_EMAIL: ${{ secrets.BRIEF_EMAIL }}
+          BRIEF_PASSWORD: ${{ secrets.BRIEF_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+
+          required = ("BRIEF_EMAIL", "BRIEF_PASSWORD",
+                      "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+          if any(not os.environ.get(k) for k in required):
+              sys.exit("MISSING_SECRETS")
+
+          state = Path("brief-count.txt")
+          try:
+              previous = int(state.read_text().strip()) if state.exists() else 0
+          except ValueError:
+              sys.exit("BAD_STORED_COUNT")
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              page = browser.new_page(locale="ru-RU")
+              try:
+                  page.goto("https://order-union-chat.poehali.ws/",
+                            wait_until="domcontentloaded", timeout=45000)
+                  email = page.locator('input[type="email"]')
+                  if email.count() == 0:
+                      email = page.get_by_placeholder("you@example.com")
+                  email.first.fill(os.environ["BRIEF_EMAIL"])
+                  page.locator('input[type="password"]').first.fill(
+                      os.environ["BRIEF_PASSWORD"])
+                  page.get_by_role("button", name="Войти", exact=True).click()
+                  page.get_by_text("Свободные заказы").first.wait_for(
+                      state="visible", timeout=35000)
+                  page.get_by_text(re.compile(r"\d+\s+открыто", re.I)).first.wait_for(
+                      state="visible", timeout=20000)
+                  text = page.locator("body").inner_text()
+                  found = re.search(r"(\d+)\s+открыто", text, re.I)
+                  if not found:
+                      sys.exit("ORDER_COUNTER_NOT_FOUND")
+                  current = int(found.group(1))
+              finally:
+                  browser.close()
+
+          print(f"FREE_ORDERS: {previous} -> {current}")
+          if current > previous:
+              message = (f"Новые свободные заказы! Сейчас открыто: {current}.\n"
+                         "https://order-union-chat.poehali.ws/")
+              url = ("https://api.telegram.org/bot"
+                     + os.environ["TELEGRAM_BOT_TOKEN"] + "/sendMessage")
+              body = urllib.parse.urlencode({
+                  "chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                  "text": message,
+              }).encode()
+              try:
+                  request = urllib.request.Request(url, data=body)
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      sent = json.load(response)
+                  if sent.get("ok") is not True:
+                      sys.exit("TELEGRAM_SEND_FAILED")
+              except Exception:
+                  sys.exit("TELEGRAM_SEND_FAILED")
+              print("ALERT_SENT")
+          else:
+              print("NO_NEW_ORDERS")
+
+          state.write_text(str(current) + "\n")
+          PY
