@@ -3,7 +3,7 @@ name: Brief orders monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: '3-58/5 * * * *'
+- cron: '4-59/5 * * * *'
 
 permissions:
   contents: read
