@@ -193,7 +193,7 @@ jobs:
                           os.environ["TELEGRAM_BOT_TOKEN"].encode(),
                           identity.encode(), hashlib.sha256).hexdigest()
                       recency = is_recent_notification(combined, absolute_when)
-                  notifications.append({"key": digest, "title": title,
+                      notifications.append({"key": digest, "title": title,
                                         "subtitle": subtitle,
                                         "order_no": order_no, "recent": recency})
               finally:
