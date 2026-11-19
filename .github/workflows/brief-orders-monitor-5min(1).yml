@@ -1,0 +1,223 @@
+name: Brief orders monitor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brief-orders-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-slim
+    timeout-minutes: 8
+    steps:
+      - name: Restore previous state
+        uses: actions/cache@v4
+        with:
+          path: |
+            brief-count.txt
+            brief-watch-state-v5.json
+          key: brief-v5-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            brief-v5-
+
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Check new orders and notifications
+        env:
+          BRIEF_EMAIL: ${{ secrets.BRIEF_EMAIL }}
+          BRIEF_PASSWORD: ${{ secrets.BRIEF_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import collections
+          import difflib
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+          from playwright.sync_api import sync_playwright
+          
+          ROOT = "https://order-union-chat.poehali.ws/"
+          needed = ("BRIEF_EMAIL", "BRIEF_PASSWORD", "TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID")
+          if any(not os.environ.get(k) for k in needed):
+              sys.exit("MISSING_SECRETS")
+          
+          count_path = Path("brief-count.txt")
+          try:
+              previous_count = int(count_path.read_text().strip()) if count_path.exists() else None
+          except ValueError:
+              sys.exit("BAD_PREVIOUS_COUNT")
+          
+          
+          def normalize(value):
+              return " ".join((value or "").split()).strip()
+          
+          
+          def fingerprint(parts):
+              raw = "\0".join(normalize(s) for s in parts)
+              return hmac.new(os.environ["TELEGRAM_BOT_TOKEN"].encode(),
+                              raw.encode(), hashlib.sha256).hexdigest()
+          
+          
+          def send_telegram(message):
+              request = urllib.request.Request(
+                  "https://api.telegram.org/bot" + os.environ["TELEGRAM_BOT_TOKEN"] + "/sendMessage",
+                  data=urllib.parse.urlencode({"chat_id": os.environ["TELEGRAM_CHAT_ID"],
+                                               "text": message[:3900]}).encode(),
+                  method="POST")
+              try:
+                  with urllib.request.urlopen(request, timeout=20) as response:
+                      result = json.load(response)
+                  if result.get("ok") is not True:
+                      sys.exit("TELEGRAM_SEND_FAILED")
+              except Exception:
+                  sys.exit("TELEGRAM_SEND_FAILED")
+          
+          with sync_playwright() as playwright:
+              browser = playwright.chromium.launch(headless=True)
+              page = browser.new_page(locale="ru-RU")
+              try:
+                  page.goto(ROOT, wait_until="domcontentloaded", timeout=45000)
+                  email = page.locator('input[type="email"]')
+                  if not email.count():
+                      email = page.get_by_placeholder("you@example.com")
+                  email.first.fill(os.environ["BRIEF_EMAIL"])
+                  page.locator('input[type="password"]').first.fill(os.environ["BRIEF_PASSWORD"])
+                  page.get_by_role("button", name="Войти", exact=True).click()
+                  page.get_by_text("Свободные заказы").first.wait_for(state="visible", timeout=35000)
+                  page.get_by_text(re.compile(r"\d+\s+открыто", re.I)).first.wait_for(
+                      state="visible", timeout=20000)
+                  match = re.search(r"(\d+)\s+открыто", page.locator("body").inner_text(), re.I)
+                  if not match:
+                      sys.exit("ORDER_COUNTER_NOT_FOUND")
+                  current_count = int(match.group(1))
+          
+                  bell = page.locator('button[aria-label*="ведом" i]')
+                  if not bell.count():
+                      sys.exit("NOTIFICATION_BELL_NOT_FOUND")
+                  bell.first.click()
+                  page.get_by_text("Уведомления", exact=True).first.wait_for(
+                      state="visible", timeout=12000)
+                  # Notification data often arrives after the panel opens.
+                  rows = page.locator("button.flex.w-full.items-start.gap-3")
+                  try:
+                      rows.first.wait_for(state="visible", timeout=12000)
+                  except Exception:
+                      # Do not silently say that no new messages were found if
+                      # a panel which previously had notifications is suddenly empty.
+                      sys.exit("NOTIFICATION_ROWS_NOT_FOUND")
+                  page.wait_for_timeout(2500)
+          
+                  notifications = []
+                  for row in rows.all()[:60]:
+                      title_nodes = row.locator("span.font-medium")
+                      if not title_nodes.count():
+                          continue
+                      title = normalize(title_nodes.first.inner_text())
+                      if not title:
+                          continue
+                      muted = [normalize(x) for x in
+                               row.locator("span.text-muted-foreground").all_inner_texts()]
+                      subtitle = muted[0] if muted else ""
+                      body = row.inner_text()
+                      order_match = re.search(r"Заказ\s*№\s*(\d+)", body, re.I)
+                      order_no = order_match.group(1) if order_match else ""
+                      event_id = (row.get_attribute("data-notification-id")
+                                  or row.get_attribute("data-event-id")
+                                  or row.get_attribute("data-id") or "")
+                      timestamp = row.locator("time[datetime]")
+                      exact_time = (timestamp.first.get_attribute("datetime")
+                                    if timestamp.count() else "")
+                      # Exclude changing labels like '39 мин назад' from identity.
+                      key = fingerprint((event_id, title, subtitle, order_no, exact_time))
+                      notifications.append({"key": key, "title": title,
+                                            "subtitle": subtitle, "order_no": order_no,
+                                            "has_id": bool(event_id or exact_time)})
+              finally:
+                  browser.close()
+          
+          if not notifications:
+              sys.exit("NOTIFICATION_DETAILS_NOT_FOUND")
+          
+          print(f"FREE_ORDERS: {previous_count} -> {current_count}")
+          print("NOTIFICATIONS_VISIBLE:", len(notifications))
+          print("STABLE_IDS_VISIBLE:", sum(n["has_id"] for n in notifications))
+          
+          state_path = Path("brief-watch-state-v5.json")
+          current_keys = [n["key"] for n in notifications]
+          if state_path.exists():
+              try:
+                  state = json.loads(state_path.read_text())
+                  if state.get("version") != 5 or not isinstance(state.get("ordered"), list):
+                      sys.exit("INVALID_NOTIFICATION_STATE")
+              except (OSError, ValueError, AttributeError):
+                  sys.exit("INVALID_NOTIFICATION_STATE")
+              before = state["ordered"]
+              known = set(state.get("known", []))
+              matched = set()
+              sm = difflib.SequenceMatcher(a=before, b=current_keys, autojunk=False)
+              for block in sm.get_matching_blocks():
+                  matched.update(range(block.b, block.b + block.size))
+              last_anchor = max(matched) if matched else -1
+              before_counts = collections.Counter(before)
+              now_counts = collections.Counter(current_keys)
+              duplicate_budget = {k: max(0, now_counts[k] - before_counts[k])
+                                  for k in now_counts}
+              fresh_indices = []
+              for i, key in enumerate(current_keys):
+                  if i in matched:
+                      continue
+                  # A row below all matched previous items is more likely an older
+                  # notification revealed by scrolling or pagination.
+                  if last_anchor >= 0 and i > last_anchor:
+                      continue
+                  if key not in known:
+                      fresh_indices.append(i)
+                  elif duplicate_budget.get(key, 0) > 0:
+                      # Two separate messages can have identical visible text.
+                      duplicate_budget[key] -= 1
+                      fresh_indices.append(i)
+              print("HISTORY_RESTORED:", len(before))
+              print("NEW_NOTIFICATIONS:", len(fresh_indices))
+              for i in reversed(fresh_indices):
+                  item = notifications[i]
+                  msg = "🔔 Бриф: новое уведомление\n" + item["title"]
+                  if item["subtitle"]:
+                      msg += "\n" + item["subtitle"][:600]
+                  if item["order_no"] and item["order_no"] not in item["title"]:
+                      msg += "\nЗаказ №" + item["order_no"]
+                  msg += "\n" + ROOT
+                  send_telegram(msg)
+              historical = [*current_keys, *state.get("known", [])]
+          else:
+              # Initialize once. Never send all existing notifications on deployment.
+              print("NOTIFICATION_BASELINE_CREATED:", len(current_keys))
+              historical = current_keys[:]
+          
+          historical = list(dict.fromkeys(historical))[:5000]
+          state_path.write_text(json.dumps({"version": 5, "ordered": current_keys,
+                                            "known": historical}, separators=(",", ":")))
+          
+          if previous_count is None:
+              print("ORDER_BASELINE_CREATED")
+          elif current_count > previous_count:
+              send_telegram(f"Новые свободные заказы! Сейчас открыто: {current_count}.\n{ROOT}")
+              print("ORDER_ALERT_SENT")
+          else:
+              print("NO_NEW_ORDERS")
+          count_path.write_text(str(current_count) + "\n")
+          PY
