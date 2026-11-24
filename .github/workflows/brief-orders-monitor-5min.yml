@@ -1,0 +1,329 @@
+name: Brief orders monitor
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: brief-orders-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-slim
+    timeout-minutes: 8
+    steps:
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: brief-state-v6.json
+          key: brief-v6-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            brief-v6-
+
+      - name: Install browser
+        run: |
+          python -m pip install --quiet playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Check new orders and notifications
+        env:
+          BRIEF_EMAIL: ${{ secrets.BRIEF_EMAIL }}
+          BRIEF_PASSWORD: ${{ secrets.BRIEF_PASSWORD }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python - <<'PY'
+          import collections
+          import hashlib
+          import hmac
+          import json
+          import os
+          import re
+          import sys
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          ROOT = 'https://order-union-chat.poehali.ws/'
+          STATE = Path('brief-state-v6.json')
+          ROWS = 'button.flex.w-full.items-start.gap-3, button:has(span.leading-snug):has(span.text-muted-foreground)'
+
+
+          def norm(s):
+              return ' '.join((s or '').split())
+
+
+          def fingerprint(*parts):
+              return hmac.new(os.environ['TELEGRAM_BOT_TOKEN'].encode(),
+                              '\0'.join(norm(p) for p in parts).encode(), hashlib.sha256).hexdigest()
+
+
+          def notification_item(title, lines, event_id='', timestamp=''):
+              title = norm(title)
+              parts = [norm(line) for line in lines if norm(line)]
+              # The footer is separate from the actual message body. Strip only the
+              # changing time label from that footer, never from the message itself.
+              meta = ''
+              if parts and re.fullmatch(r'(?:Заказ\s*№\s*\d+\s*[·•]\s*.+|Заказ\s*№\s*\d+)', parts[-1], re.I):
+                  meta = parts.pop()
+              order = re.search(r'Заказ\s*№\s*(\d+)', meta, re.I)
+              if not order:
+                  order = re.search(r'(?:заказ\w*\s*№\s*)(\d+)', title, re.I)
+              no = order.group(1) if order else ''
+              if parts and parts[0] == title:
+                  parts.pop(0)
+              body = '\n'.join(parts)
+              key = fingerprint(event_id, timestamp) if event_id else fingerprint(title, body, no, timestamp)
+              return {'key': key, 'title': title, 'body': body, 'no': no}
+
+
+          def counts(items):
+              return collections.Counter(x['key'] for x in items)
+
+
+          def new_items(all_items, unread_items, old):
+              # A first run catches currently unread events, not the entire archive.
+              a, u = counts(all_items), counts(unread_items)
+              old_a = collections.Counter(old.get('all', {})) if old else a
+              old_u = collections.Counter(old.get('unread', {})) if old else collections.Counter()
+              # Use both tabs. A new event that is already read can still appear in All.
+              wanted = {k: max(0, a[k] - old_a[k], u[k] - old_u[k]) for k in a.keys() | u.keys()}
+              result = []
+              selected = collections.Counter()
+              # Prefer unread copies, then any additional events from the full list.
+              for source in (unread_items, all_items):
+                  used = collections.Counter()
+                  for item in source:
+                      k = item['key']
+                      used[k] += 1
+                      # Counts across the two views overlap, not additive.
+                      if used[k] <= wanted.get(k, 0) and used[k] > selected[k]:
+                          result.append(item)
+                          selected[k] += 1
+              return result, {'all': dict(a), 'unread': dict(u)}
+
+
+          def telegram(text):
+              req = urllib.request.Request(
+                  'https://api.telegram.org/bot' + os.environ['TELEGRAM_BOT_TOKEN'] + '/sendMessage',
+                  data=urllib.parse.urlencode({'chat_id': os.environ['TELEGRAM_CHAT_ID'], 'text': text[:3900]}).encode(),
+                  method='POST')
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      data = json.load(r)
+                  if data.get('ok') is not True:
+                      raise RuntimeError('TELEGRAM_REJECTED')
+              except Exception:
+                  raise RuntimeError('TELEGRAM_SEND_FAILED') from None
+
+
+          def read_state():
+              if not STATE.exists():
+                  print('STATE_RESTORED: NO')
+                  return {}
+              data = json.loads(STATE.read_text())
+              if not isinstance(data, dict) or data.get('version') != 6:
+                  raise RuntimeError('STATE_INVALID')
+              print('STATE_RESTORED: YES')
+              return data
+
+
+          def save(state):
+              state['version'] = 6
+              tmp = STATE.with_suffix('.tmp')
+              tmp.write_text(json.dumps(state, separators=(',', ':')))
+              tmp.replace(STATE)
+
+
+          def login(page):
+              page.goto(ROOT, wait_until='domcontentloaded', timeout=45000)
+              email = page.locator('input[type="email"], input[placeholder="you@example.com"]').first
+              email.fill(os.environ['BRIEF_EMAIL'])
+              page.locator('input[type="password"]').first.fill(os.environ['BRIEF_PASSWORD'])
+              page.get_by_role('button', name='Войти', exact=True).click()
+              page.get_by_text('Свободные заказы', exact=True).first.wait_for(state='visible', timeout=35000)
+              page.get_by_text(re.compile(r'^\s*\d+\s+открыто\s*$', re.I)).first.wait_for(state='visible', timeout=25000)
+              # The dashboard may display an initial zero before its data arrives.
+              page.wait_for_timeout(12000)
+              print('LOGIN_OK')
+
+
+          def order_sample(page):
+              counter = page.get_by_text(re.compile(r'^\s*\d+\s+открыто\s*$', re.I)).first
+              m = re.search(r'(\d+)\s+открыто', counter.inner_text(), re.I)
+              if not m:
+                  raise RuntimeError('ORDER_COUNTER_NOT_FOUND')
+              n = int(m.group(1))
+              # Before opening the bell, look for explicit order numbers in the page.
+              # The exact layout of a nonempty order list has not been verified.
+              # Only use these candidates when their count equals the visible counter.
+              body = page.locator('body').inner_text()
+              candidates = list(dict.fromkeys(re.findall(r'(?:Заказ\s*№\s*|№\s*)(\d+)', body, re.I)))
+              ids = candidates if n > 0 and len(candidates) == n else None
+              return n, ids
+
+
+          def process_orders(samples, old):
+              previous = set((old or {}).get('ids', []))
+              alerts, unknown = [], []
+              for n, ids in samples:
+                  if n == 0:
+                      previous.clear()
+                  elif ids is None:
+                      unknown.append(n)
+                  else:
+                      now = {fingerprint('order', num) for num in ids}
+                      for num in ids:
+                          if fingerprint('order', num) not in previous and num not in alerts:
+                              alerts.append(num)
+                      previous = now
+              n, ids = samples[-1]
+              next_state = {'count': n, 'ids': sorted(previous) if n else []}
+              return alerts, max(unknown, default=0), next_state
+
+
+          def collect_rows(page):
+              items = []
+              for row in page.locator(ROWS).all():
+                  if not row.is_visible():
+                      continue
+                  # Read the structural heading instead of its font weight.
+                  # Unread headings can be semibold/bold; read ones medium.
+                  lines = row.inner_text().splitlines()
+                  title_nodes = row.locator('span.leading-snug')
+                  if title_nodes.count():
+                      title = title_nodes.first.inner_text()
+                  else:
+                      title = next((line for line in lines if norm(line)), '')
+                  if not norm(title):
+                      continue
+                  event_id = (row.get_attribute('data-notification-id') or row.get_attribute('data-event-id') or row.get_attribute('data-id') or '')
+                  t = row.locator('time[datetime]')
+                  timestamp = (t.first.get_attribute('datetime') or '') if t.count() else ''
+                  items.append(notification_item(title, lines, event_id, timestamp))
+              return items
+
+
+          def collect_notifications(page):
+              bell = page.locator('button[aria-label*="ведом" i]').first
+              badge_match = re.fullmatch(r'\s*(\d+)\s*', bell.inner_text())
+              bell_badge = int(badge_match.group(1)) if badge_match else 0
+              bell.click()
+              page.get_by_text('Уведомления', exact=True).first.wait_for(state='visible', timeout=15000)
+              unread = page.get_by_text(re.compile(r'^\s*Непрочитанные(?:\s*\d+)?\s*$')).first
+              unread.wait_for(state='visible', timeout=15000)
+              page.wait_for_timeout(3500)
+              label = norm(unread.inner_text())
+              match = re.search(r'\d+', label)
+              expected = int(match.group()) if match else bell_badge
+              print('UNREAD_BADGE:', expected)
+              all_items = collect_rows(page)
+              if not all_items:
+                  page.wait_for_timeout(4000)
+                  all_items = collect_rows(page)
+              if not all_items and not page.get_by_text(re.compile(r'^\s*(?:Уведомлений нет|Нет уведомлений|Пока нет уведомлений)\s*$', re.I)).count():
+                  raise RuntimeError('ALL_NOTIFICATIONS_NOT_FOUND')
+              unread.click()
+              # The filter is read-only; do not click a notification or Mark all read.
+              unread_items = []
+              for _ in range(5):
+                  page.wait_for_timeout(2000)
+                  unread_items = collect_rows(page)
+                  if len(unread_items) == expected:
+                      break
+              print('ALL_NOTIFICATIONS_VISIBLE:', len(all_items))
+              print('UNREAD_NOTIFICATIONS_VISIBLE:', len(unread_items))
+              # Do not discard correctly found events if the tabs change while
+              # loading or if some unread entries cannot be extracted.
+              return all_items, unread_items, expected
+
+
+
+          def main():
+              from playwright.sync_api import sync_playwright
+              required = ('BRIEF_EMAIL', 'BRIEF_PASSWORD', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID')
+              if any(not os.environ.get(k) for k in required):
+                  raise RuntimeError('MISSING_SECRETS')
+              state = read_state()
+              failures = []
+              with sync_playwright() as p:
+                  browser = p.chromium.launch(headless=True)
+                  try:
+                      page = browser.new_page(locale='ru-RU')
+                      login(page)
+                      try:
+                          samples = [order_sample(page)]
+                          page.wait_for_timeout(5000)
+                          samples.append(order_sample(page))
+                          page.wait_for_timeout(5000)
+                          samples.append(order_sample(page))
+                          print('ORDER_COUNTER_SAMPLES:', ','.join(str(n) for n, _ in samples))
+                          print('ORDER_IDS_MATCH_COUNTER:', 'NOT_APPLICABLE' if all(n == 0 for n, _ in samples) else any(ids is not None for _, ids in samples))
+                          alerts, unknown, next_orders = process_orders(samples, state.get('orders'))
+                          for num in alerts:
+                              telegram('Бриф: свободный заказ №' + num + '\n' + ROOT)
+                          if unknown:
+                              telegram(f'Бриф: обнаружены свободные заказы ({unknown}). Открой список.\n{ROOT}')
+                          print('ORDER_ALERTS_SENT:', len(alerts) + int(bool(unknown)))
+                          state['orders'] = next_orders
+                          save(state)
+                      except Exception as exc:
+                          # Never print browser error text: it may include private data.
+                          print('ORDER_CHECK_FAILED:', str(exc) if str(exc) in ('TELEGRAM_SEND_FAILED', 'ORDER_COUNTER_NOT_FOUND') else type(exc).__name__)
+                          failures.append('ORDERS')
+                      try:
+                          all_items, unread_items, expected = collect_notifications(page)
+                          old_notifications = state.get('notifications') or {}
+                          fresh, next_notifications = new_items(all_items, unread_items, old_notifications)
+                          print('NEW_NOTIFICATIONS:', len(fresh))
+                          for item in reversed(fresh):
+                              text = 'Бриф: ' + item['title']
+                              if item['body']:
+                                  text += '\n' + item['body'][:2500]
+                              text += '\n' + ROOT
+                              telegram(text)
+                          print('NOTIFICATION_ALERTS_SENT:', len(fresh))
+                          if len(unread_items) != expected:
+                              # Preserve prior unread observations on a partial scan.
+                              # Send a generic warning so a nonzero badge is not silent.
+                              known = collections.Counter(old_notifications.get('unread', {}))
+                              known.update({k: max(0, n - known[k]) for k, n in counts(unread_items).items()})
+                              next_notifications['unread'] = dict(known)
+                              next_notifications['all'] = dict(collections.Counter(old_notifications.get('all', {})) | counts(all_items))
+                              if expected > 0 and old_notifications.get('partial_badge') != expected:
+                                  telegram(f'Бриф: непрочитанных уведомлений: {expected}. Не удалось получить полный текст. Открой сайт.\n{ROOT}')
+                                  print('BADGE_ALERT_SENT: YES')
+                              next_notifications['partial_badge'] = expected
+                              print('UNREAD_PARTIAL: YES')
+                              failures.append('NOTIFICATIONS_PARTIAL')
+                          else:
+                              print('UNREAD_PARTIAL: NO')
+                          state['notifications'] = next_notifications
+                          save(state)
+                      except Exception as exc:
+                          allowed = ('TELEGRAM_SEND_FAILED', 'ALL_NOTIFICATIONS_NOT_FOUND', 'UNREAD_COUNT_MISMATCH', 'NOTIFICATION_SNAPSHOT_MISMATCH')
+                          print('NOTIFICATION_CHECK_FAILED:', str(exc) if str(exc) in allowed else type(exc).__name__)
+                          failures.append('NOTIFICATIONS')
+                  finally:
+                      browser.close()
+              if failures:
+                  sys.exit('CHECK_FAILED: ' + ','.join(failures))
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as exc:
+                  print('FATAL:', str(exc) if str(exc) in ('MISSING_SECRETS', 'STATE_INVALID') else type(exc).__name__)
+                  sys.exit(1)
+          PY
+
+      - name: Save confirmed state
+        if: ${{ always() && hashFiles('brief-state-v6.json') != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: brief-state-v6.json
+          key: brief-v6-${{ github.run_id }}-${{ github.run_attempt }}
